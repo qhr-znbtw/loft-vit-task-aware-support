@@ -1,125 +1,101 @@
-# ViT Transfer-Learning Baselines
+# LOFT Task-Aware Support Study
 
-A compact and reproducible benchmark for comparing three transfer-learning strategies on a frozen ViT-B/16 backbone:
+A transparent ViT-B/16 reproduction of **LOFT: Low-Rank Orthogonal Fine-Tuning via Task-Aware Support Selection**. The project isolates the adaptation support while keeping the rank, orthogonal transform, trainable parameter count, backbone, and data protocol fixed.
 
-- **Linear Probe** — train only a task-specific classifier.
-- **LoRA** — adapt the Query and Value projections with rank-8 low-rank updates.
-- **Block OFT** — adapt the Query and Value projections with block-diagonal orthogonal transformations.
+Three support choices are implemented:
 
-The repository uses the same backbone, data splits, optimizer family, schedule, preprocessing, and random seed across all methods. Its purpose is to provide a clean baseline for later research on orthogonal and parameter-efficient fine-tuning methods.
+- **Principal** — top right-singular subspace of the frozen pretrained weight.
+- **GradSVD** — top right-singular subspace of the initial downstream gradient.
+- **SkewGrad** — top invariant subspace of the task signal `skew(W^T G)`.
 
-## Benchmark
-
-The experiments use a three-task subset inspired by VTAB, chosen to cover different visual domains:
-
-| Task | Domain | Classes | Train | Validation | Test |
-| --- | --- | ---: | ---: | ---: | ---: |
-| DTD | Natural textures | 47 | 800 | 200 | 1,880 |
-| EuroSAT | Satellite imagery | 10 | 800 | 200 | 5,400 |
-| dSprites Orientation | Structured synthetic images | 16 | 800 | 200 | 73,728 |
-
-The pretrained backbone is `google/vit-base-patch16-224-in21k`. Adapter methods modify the Query and Value projections in all 12 Transformer encoder blocks while keeping the original pretrained parameters frozen.
+Linear Probe, LoRA, and Block OFT are retained as reference baselines.
 
 ## Results
 
-All results below use one fixed seed (`42`) and the best validation checkpoint from a 100-epoch run.
+All LOFT runs use rank 46, one orthogonal factor, 72 adapted Transformer linears, seed 42, and the best checkpoint on a 200-example validation set.
 
-| Method | DTD | EuroSAT | dSprites Orientation | Adapter parameters |
-| --- | ---: | ---: | ---: | ---: |
-| Linear Probe | 67.13% | 89.24% | 24.48% | 0 |
-| LoRA, rank 8, Q+V | 69.68% | **94.24%** | **49.58%** | 294,912 |
-| Block OFT, block size 24, Q+V | **70.27%** | 93.76% | 46.07% | **211,968** |
+| Method | DTD | EuroSAT | dSprites Orientation | Mean | Adapter parameters |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Linear Probe | 67.13% | 89.24% | 24.48% | 60.28% | 0 |
+| LoRA, rank 8, Q+V | 69.68% | 94.24% | 49.58% | 71.17% | 294,912 |
+| Block OFT, block 24, Q+V | 70.27% | 93.76% | 46.07% | 70.03% | 211,968 |
+| LOFT-Principal | 69.79% | **96.33%** | 45.31% | 70.48% | **74,520** |
+| LOFT-GradSVD | 70.05% | 95.85% | 49.72% | 71.87% | **74,520** |
+| LOFT-SkewGrad | **70.59%** | 94.19% | **52.24%** | **72.34%** | **74,520** |
 
-LoRA gives the strongest result on EuroSAT and dSprites Orientation. Block OFT gives the best DTD accuracy while using 28.1% fewer adapter parameters than LoRA. These are single-seed results and should be interpreted as a controlled implementation benchmark rather than a statistically conclusive ranking.
+SkewGrad improves over Principal by 6.93 points on dSprites Orientation and by 1.86 mean points across the three tasks. It also exceeds the LoRA mean by 1.17 points while using 74.7% fewer adapter parameters. Principal remains strongest on EuroSAT, showing that task-aware support is useful but not universally superior.
 
-Detailed parameter counts, timings, peak GPU memory, and best epochs are available in the [benchmark report](reports/baseline_benchmark.md).
+These are single-seed Mini-VTAB-3 results, not an exact reproduction of the paper's five-seed VTAB-19 aggregate. See the [full reproduction report](reports/loft_reproduction.md) for protocol details, timing, memory, limitations, and interpretation.
 
-## Experimental Protocol
+## Method
+
+For a frozen weight `W`, row-orthonormal support `P`, and trainable orthogonal transform `T`, LOFT uses
+
+```text
+W+ = W [I + P^T (T - I) P].
+```
+
+`P` determines where adaptation acts. `T` is generated from 1,035 independent skew coordinates through an exact Cayley transform. At initialization `T=I`, so the adapted model exactly equals the pretrained model.
+
+For gradient-informed variants, one training mini-batch is used once before training to estimate each target weight gradient. The resulting supports are then fixed for the complete run.
+
+## Configuration
 
 | Setting | Value |
 | --- | --- |
-| Backbone | ViT-B/16 pretrained on ImageNet-21k |
-| Input size | 224 x 224 RGB |
-| Epochs | 100 |
-| Warmup | 10 epochs |
-| Schedule | Linear warmup followed by cosine decay |
-| Training batch size | 64 |
-| Evaluation batch size | 128 |
-| Optimizer | AdamW |
-| Adapter learning rate | `1e-4` |
-| Classification-head learning rate | `1e-3` |
-| Weight decay | `1e-4` |
-| Loss | Cross-entropy |
-| Precision | BF16 automatic mixed precision when supported |
-| Data augmentation | None |
-| Random seed | 42 |
+| Backbone | `google/vit-base-patch16-224-in21k` |
+| Tasks | DTD, EuroSAT, dSprites Orientation |
+| Train / validation samples | 800 / 200 per task |
+| Target modules | Q, K, V, attention output, MLP fc1, MLP fc2 |
+| Injected layers | 72 |
+| Rank / factor depth | 46 / 1 |
+| Transform | Exact Cayley orthogonal transform |
+| Calibration batches | 0 for Principal, 1 for GradSVD/SkewGrad |
+| Epochs / warmup | 50 / 5 |
+| Classifier learning rate | `5e-3` |
+| Batch size | 64 training, 128 evaluation |
+| Weight decay / dropout | `1e-3` / `0.1` |
+| Optimizer / schedule | AdamW / cosine |
+| Seed | 42 |
+
+The LOFT learning rates are the paper's rank-46 task-specific values:
+
+| Support | DTD | EuroSAT | dSprites Orientation |
+| --- | ---: | ---: | ---: |
+| Principal | `2e-4` | `2e-3` | `2e-3` |
+| GradSVD | `3.5e-4` | `1.78e-3` | `1.3e-3` |
+| SkewGrad | `2e-4` | `8e-4` | `9e-4` |
 
 ## Repository Structure
 
 ```text
 .
-├── experiments/
-│   ├── linear_probe/          # Frozen backbone and trainable classifier
-│   ├── lora/                  # Rank-8 Query/Value LoRA
-│   └── oft/                   # Block-diagonal Query/Value OFT
-├── vit_core/                  # Shared ViT, data, training, and evaluation code
-├── scripts/                   # Dataset and pretrained-weight preparation
-├── tests/                     # Algebra, integration, and loading checks
-├── results/                   # Formal 100-epoch result files
-├── reports/                   # Benchmark report
-├── data/                      # Local only; ignored by Git
-├── pretrained/                # Local only; ignored by Git
-└── checkpoints/               # Local only; ignored by Git
+|-- experiments/
+|   |-- linear_probe/          # Frozen-backbone baseline
+|   |-- lora/                  # Rank-8 Q/V LoRA baseline
+|   |-- oft/                   # Block-OFT baseline
+|   `-- loft/                  # LOFT layer, support construction, and runner
+|-- vit_core/                  # Shared ViT, data, training, and evaluation
+|-- scripts/                   # Dataset and pretrained-weight preparation
+|-- tests/                     # Algebra, support, injection, and smoke tests
+|-- results/                   # Machine-readable formal results
+|-- reports/                   # Baseline and LOFT reports
+|-- data/                      # Local only; ignored by Git
+|-- pretrained/                # Local only; ignored by Git
+`-- checkpoints/               # Local only; ignored by Git
 ```
 
-The ViT backbone and adaptation layers are implemented directly in PyTorch. Official Hugging Face weights are mapped into this transparent implementation rather than hiding the experiment behind a complete off-the-shelf classification model.
+## Reproduction
 
-## Installation
-
-Python 3.10 or newer is recommended. Install a CUDA-compatible PyTorch build from the [official installation guide](https://pytorch.org/get-started/locally/), then install the remaining dependencies:
+After preparing the existing Mini-VTAB-3 data and ViT weights:
 
 ```bash
-pip install -r requirements.txt
+python -m experiments.loft.run_loft --support principal --task dtd
+python -m experiments.loft.run_loft --support grad_svd --task dtd
+python -m experiments.loft.run_loft --support skew_grad --task dtd
 ```
 
-## Data and Weights
-
-Download DTD and EuroSAT:
-
-```bash
-python -m scripts.download_mini_vtab
-```
-
-Prepare dSprites Orientation:
-
-```bash
-python -m scripts.prepare_dsprites_orientation
-```
-
-Download the pretrained ViT-B/16 weights:
-
-```bash
-python -m scripts.download_pretrained_model
-```
-
-Datasets, pretrained weights, checkpoints, and model binaries are intentionally excluded from Git.
-
-## Running the Baselines
-
-Each entry point requires one of `dtd`, `eurosat`, or `dsprites_orientation`.
-
-```bash
-# Frozen-backbone linear probe
-python -m experiments.linear_probe.run_linear_probe --task dtd
-
-# LoRA
-python -m experiments.lora.run_lora --task dtd
-
-# Block OFT
-python -m experiments.oft.run_oft --task dtd
-```
-
-Replace `dtd` with another supported task to reproduce the remaining results. The best validation checkpoint and a JSON result summary are saved automatically.
+Replace `dtd` with `eurosat` or `dsprites_orientation` to reproduce the other tasks.
 
 ## Verification
 
@@ -128,15 +104,14 @@ python -m tests.test_pretrained_loading
 python -m tests.test_linear_probe
 python -m tests.test_lora
 python -m tests.test_oft
+python -m tests.test_loft_layer
+python -m tests.test_loft_integration
 ```
-
-## Scope
-
-This repository deliberately contains only three standard baselines. More experimental methods such as HRA and HOFT can be developed in a separate research repository while reusing the protocol defined here.
 
 ## References
 
-- [An Image is Worth 16x16 Words](https://arxiv.org/abs/2010.11929)
+- [LOFT: Low-Rank Orthogonal Fine-Tuning via Task-Aware Support Selection](https://arxiv.org/abs/2605.11872)
 - [Visual Task Adaptation Benchmark](https://arxiv.org/abs/1910.04867)
-- [LoRA: Low-Rank Adaptation of Large Language Models](https://arxiv.org/abs/2106.09685)
-- [Controlling Text-to-Image Diffusion by Orthogonal Finetuning](https://arxiv.org/abs/2306.07280)
+- [Vision Transformer](https://arxiv.org/abs/2010.11929)
+- [LoRA](https://arxiv.org/abs/2106.09685)
+- [Orthogonal Fine-Tuning](https://arxiv.org/abs/2306.07280)
